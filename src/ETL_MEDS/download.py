@@ -1,13 +1,61 @@
 import logging
 import os
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from omegaconf import DictConfig
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+# (connect_timeout_s, read_timeout_s) — applied to every requests.Session.get below.
+# Without these, a stalled HTTPS connection blocks recv() forever and the whole
+# pipeline hangs silently with no progress, no error, no heartbeat. PhysioNet
+# in particular is known to drop connections mid-stream, which is what motivated
+# this change.
+DEFAULT_TIMEOUT = (30.0, 120.0)
+
+# Heartbeat / chunking knobs for download_file. Using 1 MiB chunks (vs the
+# previous 8 KiB) reduces Python-loop overhead on large files. Logging a
+# progress line every 30 s makes long-running downloads observable from
+# outside the process.
+_CHUNK_SIZE_BYTES = 1 << 20
+_PROGRESS_LOG_INTERVAL_S = 30.0
+
+
+def _retry_adapter() -> HTTPAdapter:
+    """An HTTPAdapter that transparently retries transient failures.
+
+    Retries on connection errors and the standard "try again later" status
+    codes (429 + 5xx). With backoff_factor=2 and total=10 the worst-case wait
+    is bounded at a few minutes per file, which is short relative to the size
+    of typical clinical datasets.
+    """
+    retry = Retry(
+        total=10,
+        backoff_factor=2.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        respect_retry_after_header=True,
+    )
+    return HTTPAdapter(max_retries=retry)
+
+
+def _configure_session(session: requests.Session) -> requests.Session:
+    """Mount retry-capable adapters on the session, if it supports them.
+
+    The mock sessions used in doctests don't expose `mount`; in that case we
+    leave the session as-is so the existing test suite keeps working.
+    """
+    if hasattr(session, "mount"):
+        adapter = _retry_adapter()
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    return session
 
 
 class MockResponse:  # pragma: no cover
@@ -44,7 +92,7 @@ class MockSession:  # pragma: no cover
         self.headers = {}
         self.auth = None
 
-    def get(self, url: str, stream: bool = False):
+    def get(self, url: str, stream: bool = False, **_: object):
         if self.expect_url is not None and url != self.expect_url:
             raise ValueError(f"Expected URL {self.expect_url}, got {url}")
         if isinstance(self.return_status, dict):
@@ -100,7 +148,7 @@ def download_file(url: str, output_dir: Path, session: requests.Session):
         ValueError: Failed to download http://example.com
     """
     try:
-        response = session.get(url, stream=True)
+        response = session.get(url, stream=True, timeout=DEFAULT_TIMEOUT)
         if response.status_code != 200:
             logger.error(f"Failed to download {url} in streaming download_file get: {response.status_code}")
         response.raise_for_status()
@@ -111,10 +159,19 @@ def download_file(url: str, output_dir: Path, session: requests.Session):
     filename = os.path.basename(parsed_url.path) or "index.html"
     file_path = Path(output_dir) / filename
 
+    written = 0
+    last_log = time.monotonic()
     with open(file_path, "wb") as file:
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in response.iter_content(chunk_size=_CHUNK_SIZE_BYTES):
+            if not chunk:
+                continue
             file.write(chunk)
-    logger.info(f"Downloaded: {file_path}")
+            written += len(chunk)
+            now = time.monotonic()
+            if now - last_log >= _PROGRESS_LOG_INTERVAL_S:
+                logger.info(f"  {file_path.name}: {written / (1 << 20):.1f} MiB downloaded so far")
+                last_log = now
+    logger.info(f"Downloaded: {file_path} ({written} bytes)")
 
 
 def crawl_and_download(base_url: str, output_dir: Path, session: requests.Session):
@@ -162,9 +219,10 @@ def crawl_and_download(base_url: str, output_dir: Path, session: requests.Sessio
 
     if not base_url.endswith("/"):
         download_file(base_url, output_dir, session)
+        return
 
     try:
-        response = session.get(base_url)
+        response = session.get(base_url, timeout=DEFAULT_TIMEOUT)
         if response.status_code != 200:
             logger.error(f"Failed to download {base_url} in initial get: {response.status_code}")
         response.raise_for_status()
@@ -284,7 +342,7 @@ def download_data(
     urls += dataset_info.urls.get("common", [])
 
     for url in urls:
-        session = session_factory()
+        session = _configure_session(session_factory())
 
         if isinstance(url, (dict, DictConfig)):
             username = url.get("username", None)
